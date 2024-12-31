@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import polka = require('polka');
 import * as crypto from 'crypto';
+import pathd from 'path';
+
 
 interface TimeEntry {
     path: string;
@@ -9,6 +11,7 @@ interface TimeEntry {
     endTime ? : number;
     id ? : string;
     created_at ? : number;
+    duration?: number;
 }
 
 let statusBarItem: vscode.StatusBarItem;
@@ -65,8 +68,6 @@ export class AuthenticationProvider {
                         })
                     });
 
-                    console.log('Response status:', response.status);
-                    console.log('Response headers:', [...response.headers.entries()]);
 
                     // If response is not ok, handle the error
                     if (!response.ok) {
@@ -97,7 +98,6 @@ export class AuthenticationProvider {
                     await this.storeToken(this.token);
 
                     server.server?.close();
-                    vscode.window.showInformationMessage('Successfully authenticated with Laravel!');
 
                     resolve(this.token);
                 } catch (err) {
@@ -116,7 +116,6 @@ export class AuthenticationProvider {
                 const authUrl = `${this.baseUrl}/vscode/authorize?` +
                     `state=${state}&redirect_uri=http://localhost:${port}/callback`;
 
-                console.log('Authorization URL:', authUrl);
                 vscode.env.openExternal(vscode.Uri.parse(authUrl));
             });
         });
@@ -128,7 +127,6 @@ export class AuthenticationProvider {
             if (!token) {
                 return false;
             }
-
             // Verify token validity by making a request to Laravel
             const response = await fetch(`${this.baseUrl}/api/user`, {
                 headers: {
@@ -153,6 +151,7 @@ export class AuthenticationProvider {
                     method: 'POST',
                     headers: {
                         'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json',
                         'Accept': 'application/json'
                     }
                 });
@@ -214,58 +213,82 @@ export class OfflineSyncManager {
 
     // Save time entry with offline fallback
     async saveTimeEntry(timeEntry: TimeEntry, token: string | undefined): Promise < void > {
-        if (!token) {
-            token = '';
-        }
 
-
-
-        try {
-            if (!timeEntry.path) {
-                throw new Error('Something went wrong');
+        if(token){
+            try {
+                if (!timeEntry.path) {
+                    throw new Error('Something went wrong');
+                }
+    
+                const response = await fetch(`${this.baseUrl}/api/wahda`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        Authorization: `Bearer ${token}`
+                    },
+                    body: JSON.stringify(timeEntry)
+                });
+    
+            
+    
+                if (!response.ok) {
+                    // Check for specific HTTP status codes
+                    if (response.status === 401) {
+                        vscode.window.showErrorMessage('In order to sync the time records, please login.');
+                        await this.saveOffline(timeEntry);
+                    } else {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                } else {
+                    await response.json();
+                }
+    
+    
+    
+            } catch (error) {
+                // Add timestamp when saving offline
+                timeEntry.created_at = new Date().getTime();
+                await this.saveOffline(timeEntry);
+                vscode.window.showInformationMessage('Time entry saved offline. Will sync when connection is restored.');
             }
-
-            const response = await fetch(`${this.baseUrl}/api/wahda`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`
-                },
-                body: JSON.stringify(timeEntry)
-            });
-
-            if (!response.ok) {
-                console.log('not okay');
-
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-
-            await response.json();
-
-        } catch (error) {
-            console.log('Saving offline due to error:', error);
-            // Add timestamp when saving offline
-            timeEntry.created_at = new Date().getTime();
+        }else{
             await this.saveOffline(timeEntry);
-            console.log(timeEntry);
-            vscode.window.showInformationMessage('Time entry saved offline. Will sync when connection is restored.');
+
+            const pendingEntries = await this.getPendingEntries();
+
+            vscode.window.showInformationMessage(`Please authenticate. The count of the offline entries are: ${pendingEntries.length}`);
         }
+
+
+      
     }
 
-    // Save entry to offline storage
-    private async saveOffline(timeEntry: TimeEntry): Promise < void > {
-        console.log('saving offline');
-        const pendingEntries = await this.getPendingEntries();
 
-        // Add unique ID to offline entries for tracking
+    private async saveOffline(timeEntry: TimeEntry): Promise<void> {
+        const pendingEntries = await this.getPendingEntries();
+    
+        // Generate unique ID for the new entry
+        const newId = `offline_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         const offlineEntry = {
             ...timeEntry,
-            id: `offline_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+            id: newId
         };
-
-        pendingEntries.push(offlineEntry);
-        await this.context.globalState.update(OfflineSyncManager.PENDING_ENTRIES_KEY, pendingEntries);
+    
+        // Check for duplicate based on content (adjust these fields based on your TimeEntry type)
+        const isDuplicate = pendingEntries.some(entry => 
+            entry.path === timeEntry.path &&
+            entry.startTime === timeEntry.startTime &&
+            entry.endTime === timeEntry.endTime &&
+            entry.duration === timeEntry.duration
+        );
+    
+        if (!isDuplicate) {
+            pendingEntries.push(offlineEntry);
+            await this.context.globalState.update(OfflineSyncManager.PENDING_ENTRIES_KEY, pendingEntries);
+        }
     }
+    
 
     // Get all pending offline entries
     private async getPendingEntries(): Promise < TimeEntry[] > {
@@ -274,42 +297,49 @@ export class OfflineSyncManager {
 
     // Try to sync on extension activation
     async syncOnActivation(token: string | undefined): Promise < void > {
-        const pendingEntries = await this.getPendingEntries();
 
-        if (pendingEntries.length === 0) {
-            return;
-        }
+        if(token){
+            const pendingEntries = await this.getPendingEntries();
+            if (pendingEntries.length === 0) {
+                vscode.window.showErrorMessage('No entries to sync.');
+                return;
 
-        try {
-            // Try to sync all entries at once
-            const response = await fetch(`${this.baseUrl}/barcha`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`
-                },
-                body: JSON.stringify({
-                    entries: pendingEntries
-                })
-            });
-
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
             }
-
-
-
-            // If sync was successful, clear the offline entries
-            await this.clearPendingEntries();
-            console.log('success saving the pending entries and its now 0', pendingEntries);
-
-            console.log('Successfully synced offline entries');
-            vscode.window.showInformationMessage(`Successfully synced ${pendingEntries.length} offline entries`);
-
-        } catch (error) {
-            console.error('Failed to sync offline entries:', error);
-            // Do nothing on failure - keep the entries for next attempt
+            try {
+                // Try to sync all entries at once
+                const response = await fetch(`${this.baseUrl}/api/barcha`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        Authorization: `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        entries: pendingEntries
+                    })
+                });
+    
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        vscode.window.showErrorMessage('In order to sync the time records, please log in.');
+                    } else {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                } else {
+                    await this.clearPendingEntries();
+                    vscode.window.showInformationMessage(`Successfully synced offline entries.`);
+                }
+        
+    
+            } catch (error) {
+                console.error('Failed to sync offline entries:', error);
+            }
+        }else{
+            vscode.window.showInformationMessage(`Authenticate Please.`);
         }
+
+
+       
     }
 
     // Clear all pending entries after successful sync
@@ -349,6 +379,7 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.commands.registerCommand('time-tracker.authenticate', async () => {
                 try {
                     const isAlreadyAuthenticated = await authProvider.isAuthenticated();
+                    const token = await authProvider.getStoredToken();
                     if (isAlreadyAuthenticated) {
                         const choice = await vscode.window.showInformationMessage(
                             'You are already authenticated. Would you like to reauthenticate?',
@@ -382,7 +413,6 @@ export async function activate(context: vscode.ExtensionContext) {
     
     
     
-        console.log('Time tracking extension activated');
 
         const activeEditor = vscode.window.activeTextEditor;
         if (activeEditor?.document.uri.scheme === 'file') {
@@ -406,6 +436,7 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.window.onDidChangeActiveTextEditor(async (editor) => {
                 try {
                     await stopTrackingIfNeeded();
+
                     if (editor?.document.uri.scheme === 'file') {
                         await handleActivity(editor.document.fileName);
                     }
@@ -443,7 +474,6 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-    // stopTracking();
     stopTrackingIfNeeded();
     if (activityTimer) {
         clearTimeout(activityTimer);
@@ -451,17 +481,21 @@ export function deactivate() {
 
 }
 
+let projectName: string|undefined;
+
 async function handleActivity(fileName: string) {
 
     try {
         const currentTime = Date.now();
+        projectName = getWorkspaceForFile(fileName);
+        
 
         if (isTracking && (currentTime - lastActivityTime >= 120000)) {
             await stopTrackingIfNeeded();
         }
 
         if (!isTracking || activeFile !== fileName) {
-            await startTracking(fileName);
+            await startTracking(fileName, projectName);
         }
 
         lastActivityTime = currentTime;
@@ -483,63 +517,6 @@ async function handleActivity(fileName: string) {
     } catch (error) {
         console.error('Error in handleActivity:', error);
     }
-
-    // const currentTime = Date.now();
-    
-    // // If inactive for too long, stop current tracking
-    // if (isTracking && (currentTime - lastActivityTime >= 120000)) {
-    //     stopTrackingIfNeeded();
-    // }
-
-    // // Start new tracking session or continue existing one
-    // if (!isTracking || activeFile !== fileName) {
-    //     startTracking(fileName);
-    // }
-
-    // // Update activity timestamp
-    // lastActivityTime = currentTime;
-
-    // // Reset inactivity timer
-    // if (activityTimer) {
-    //     clearTimeout(activityTimer);
-    // }
-
-    // activityTimer = setTimeout(() => {
-    //     const inactiveTime = Date.now() - lastActivityTime;
-    //     if (inactiveTime >= 60000) {
-    //         stopTrackingIfNeeded();
-    //     }
-    // }, 60000);
-
-    
-    // console.log('hello world');
-    //here ends working bloc
-
-
-
-
-    // const currentTime = Date.now();
-    // // If tracking a different file, stop the old one first
-    // if (isTracking && activeFile && activeFile !== fileName) {
-    //     stopTrackingIfNeeded();
-    // }
-    // // Start tracking new file
-    // if (!isTracking || activeFile !== fileName) {
-    //     startTracking(fileName);
-    // }
-    // // Update last activity time
-    // lastActivityTime = currentTime;
-    // // Reset inactivity timer
-    // if (activityTimer) {
-    //     clearTimeout(activityTimer);
-    // }
-    // // Set inactivity timer (1 minute)
-    // activityTimer = setTimeout(() => {
-    //     const inactiveTime = Date.now() - lastActivityTime;
-    //     if (inactiveTime >= 60000) {
-    //         stopTrackingIfNeeded();
-    //     }
-    // }, 60000);
 }
 
 function getWorkspaceForFile(filePath: string): string | undefined {
@@ -558,9 +535,7 @@ async function stopTrackingIfNeeded() {
             if (currentTimeEntry    ) {
                 currentTimeEntry.endTime = Date.now();
                 const token = await authProvider.getStoredToken();
-                if (token) { 
-                    await syncManager.saveTimeEntry(currentTimeEntry, token);
-                }
+                await syncManager.saveTimeEntry(currentTimeEntry, token);
     
                 currentTimeEntry = undefined;
     
@@ -585,17 +560,17 @@ async function stopTrackingIfNeeded() {
     }
 }
 
-async function startTracking(fileName: string) {
+async function startTracking(fileName: string, projectName: string|undefined) {
     try{
         activeFile = fileName;
         isTracking = true;
         isRunning = false;
         const token = await authProvider.getStoredToken();
-        if (token) { 
-            await syncManager.syncOnActivation(token);
-        }
+        
+
         currentTimeEntry = {
-            path: fileName,
+            path: pathd.basename(fileName),
+            project: projectName,
             startTime: Date.now(),
         };
         if (updateInterval) {
@@ -603,6 +578,10 @@ async function startTracking(fileName: string) {
         }
         updateStatusBar();
         updateInterval = setInterval(updateStatusBar, 1000);
+
+        if (token) { 
+            await syncManager.syncOnActivation(token);
+        }
     }catch(error){
         console.error('Error in startTracking:', error);
     }

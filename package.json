@@ -2,6 +2,10 @@
   "name": "time-tacker",
   "displayName": "time-tracker",
   "description": "Hello world",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/koossaayy/timekeeepr.git"
+  },
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.96.0"
