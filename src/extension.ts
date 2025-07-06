@@ -291,7 +291,7 @@ export class OfflineSyncManager {
     
 
     // Get all pending offline entries
-    private async getPendingEntries(): Promise < TimeEntry[] > {
+    async getPendingEntries(): Promise < TimeEntry[] > {
         return this.context.globalState.get < TimeEntry[] > (OfflineSyncManager.PENDING_ENTRIES_KEY, []);
     }
 
@@ -300,6 +300,8 @@ export class OfflineSyncManager {
 
         if(token){
             const pendingEntries = await this.getPendingEntries();
+           
+            console.log(pendingEntries);
             if (pendingEntries.length === 0) {
                 vscode.window.showErrorMessage('No entries to sync.');
                 return;
@@ -343,7 +345,7 @@ export class OfflineSyncManager {
     }
 
     // Clear all pending entries after successful sync
-    private async clearPendingEntries(): Promise < void > {
+    async clearPendingEntries(): Promise < void > {
         await this.context.globalState.update(OfflineSyncManager.PENDING_ENTRIES_KEY, []);
     }
 }
@@ -362,7 +364,91 @@ let activityTimer: NodeJS.Timeout | undefined;
 
 
 
+async function getGitInfo(): Promise<{ 
+    isEnabled: boolean;
+    branchName: string | null;
+    repoName: string | null;
+    remoteUrl: string | null;
+    owner: string | null;
+    workspaceRoot: string | null;
+    lastCommitHash: string | null;
+    remoteName: string | null;
+}> {
+    try {
+        const gitExtension = vscode.extensions.getExtension('vscode.git')?.exports;
+        if (!gitExtension) {
+            return {
+                isEnabled: false,
+                branchName: null,
+                repoName: null,
+                remoteUrl: null,
+                owner: null,
+                workspaceRoot: null,
+                lastCommitHash: null,
+                remoteName: null
+            };
+        }
 
+        const git = gitExtension.getAPI(1);
+        const repository = git.repositories[0];
+        
+        if (!repository) {
+            return {
+                isEnabled: false,
+                branchName: null,
+                repoName: null,
+                remoteUrl: null,
+                owner: null,
+                workspaceRoot: null,
+                lastCommitHash: null,
+                remoteName: null
+            };
+        }
+
+        // Get repository name from the root path
+        const rootUri = repository.rootUri;
+        const repoName = rootUri.path.split('/').pop() || 
+                       rootUri.path.split('\\').pop() || 
+                       null;
+
+        // Get remote information
+        const remotes = repository.state.remotes;
+        const originRemote = remotes.find(remote => remote.name === 'origin') || remotes[0];
+        const remoteUrl = originRemote?.fetchUrl || null;
+        
+        // Extract owner from remote URL (works for both HTTPS and SSH URLs)
+        let owner: string | null = null;
+        if (remoteUrl) {
+            const match = remoteUrl.match(/[:/]([^/]+)\/[^/]+\.git$/);
+            if (match) {
+                owner = match[1];
+            }
+        }
+
+        return {
+            isEnabled: true,
+            branchName: repository.state.HEAD?.name || null,
+            repoName: repoName,
+            remoteUrl: remoteUrl,
+            owner: owner,
+            workspaceRoot: rootUri.fsPath,
+            lastCommitHash: repository.state.HEAD?.commit || null,
+            remoteName: originRemote?.name || null
+        };
+    } catch (error) {
+        console.error('Error getting Git info:', error);
+        return {
+            isEnabled: false,
+            branchName: null,
+            repoName: null,
+            remoteUrl: null,
+            owner: null,
+            workspaceRoot: null,
+            lastCommitHash: null,
+            remoteName: null
+        };
+    }
+}
 export async function activate(context: vscode.ExtensionContext) {
 
     try{
@@ -404,6 +490,22 @@ export async function activate(context: vscode.ExtensionContext) {
                 try {
                     await authProvider.logout();
                     vscode.window.showInformationMessage('Logged out successfully!');
+                } catch (error) {
+                    vscode.window.showErrorMessage('Logout failed: ' + error);
+                }
+            })
+        );
+
+        context.subscriptions.push(
+            vscode.commands.registerCommand('time-tracker.clear', async () => {
+                try {
+                    let pendingEntries = await syncManager.getPendingEntries();
+                    if(pendingEntries.length === 0){
+                        vscode.window.showInformationMessage('No Old Entires');
+                    }else{
+                        await syncManager.clearPendingEntries();
+                        vscode.window.showInformationMessage('Cleared old ones');
+                    }
                 } catch (error) {
                     vscode.window.showErrorMessage('Logout failed: ' + error);
                 }
@@ -489,6 +591,8 @@ async function handleActivity(fileName: string) {
         const currentTime = Date.now();
         projectName = getWorkspaceForFile(fileName);
         
+        const gitInfo = await getGitInfo();
+        console.log('git stuff', gitInfo);
 
         if (isTracking && (currentTime - lastActivityTime >= 120000)) {
             await stopTrackingIfNeeded();

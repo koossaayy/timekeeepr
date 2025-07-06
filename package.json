@@ -35,7 +35,12 @@
       {
         "command": "time-tracker.logout",
         "title": "LogoutHelloWorld"
+      },
+      {
+        "command": "time-tracker.clear",
+        "title": "Clear old entries"
       }
+      
     ]
   },
   "scripts": {
